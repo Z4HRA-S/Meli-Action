@@ -1,4 +1,4 @@
-name: Download Webpage as MHTML
+name: ذخیره صفحه به MHTML
 
 on:
   workflow_dispatch:
