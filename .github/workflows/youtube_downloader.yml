@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: 'YouTube video/playlist URL'
+        description: 'YouTube video URL'
         required: true
         type: string
       output_format:
@@ -20,8 +20,15 @@ on:
         required: false
         type: string
         default: '720p'
+      youtube_cookies:
+        description: |
+          (اختیاری) محتوای فایل cookies.txt از مرورگر شما
+          راهنما: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
+        required: false
+        type: string
+        default: ''
       max_part_mb:
-        description: 'Max split size in MB (0 or blank = auto 95MB)'
+        description: 'Max split size in MB (0 = auto 95MB)'
         required: false
         type: string
         default: '95'
@@ -40,69 +47,62 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # ─────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ─────────────────────────────────────────
-      - name: Install system dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y zip curl python3 python3-pip ffmpeg
-          pip3 install --quiet --upgrade yt-dlp requests
+          # Always use latest yt-dlp (bot detection fixes ship frequently)
+          pip3 install --quiet --upgrade yt-dlp
 
-      # ─────────────────────────────────────────
-      - name: Validate and normalise inputs
+      # ── Write cookies file if provided ──────────────────────────────────
+      - name: Prepare cookies
+        id: cookies
+        run: |
+          COOKIE_ARG=""
+          COOKIES="${{ github.event.inputs.youtube_cookies }}"
+          if [ -n "$COOKIES" ]; then
+            echo "$COOKIES" > /tmp/yt_cookies.txt
+            COOKIE_ARG="--cookies /tmp/yt_cookies.txt"
+            echo "✅  Cookies loaded"
+          else
+            echo "ℹ️  No cookies provided — will try without"
+          fi
+          echo "cookie_arg=$COOKIE_ARG" >> $GITHUB_OUTPUT
+
+      # ── Validate inputs ─────────────────────────────────────────────────
+      - name: Validate inputs
         id: validate
         run: |
           python3 << 'PYEOF'
           import os, sys, re
 
-          url    = os.environ.get('INPUT_URL', '').strip()
+          url    = os.environ.get('INPUT_URL', '').strip().strip('*_ \t')
           fmt    = os.environ.get('INPUT_FORMAT', 'mp4').strip()
           qual   = os.environ.get('INPUT_QUALITY', '').strip()
           folder = os.environ.get('INPUT_FOLDER', 'downloads').strip()
 
-          # Strip accidental markdown bold/italic wrapping (**url**)
-          url = url.strip('*_ \t')
-
-          # Accept any youtube.com or youtu.be link (including ?si= sharing params)
-          yt_pattern = re.compile(
-              r'https?://(www\.)?(youtube\.com|youtu\.be)/\S+',
-              re.IGNORECASE,
-          )
-          if not yt_pattern.match(url):
+          if not re.match(r'https?://(www\.)?(youtube\.com|youtu\.be)/\S+', url, re.I):
               print(f"::error::Invalid YouTube URL: '{url}'")
               sys.exit(1)
 
-          # Quality defaults
           valid_video = ('144p','360p','480p','720p','1080p','1440p','2160p')
           valid_audio = ('64kbps','128kbps','192kbps','320kbps')
-
           if fmt == 'mp3':
-              if qual not in valid_audio:
-                  qual = '192kbps'
+              qual = qual if qual in valid_audio else '192kbps'
           else:
-              if qual not in valid_video:
-                  qual = '720p'
+              qual = qual if qual in valid_video else '720p'
 
-          # Folder safety
-          folder = re.sub(r'[^a-zA-Z0-9_\-/]', '_', folder).strip('/')
-          if not folder:
-              folder = 'downloads'
+          folder = re.sub(r'[^a-zA-Z0-9_\-/]', '_', folder).strip('/') or 'downloads'
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
-              fh.write(f"url={url}\n")
-              fh.write(f"fmt={fmt}\n")
-              fh.write(f"quality={qual}\n")
-              fh.write(f"folder={folder}\n")
+              fh.write(f"url={url}\nfmt={fmt}\nquality={qual}\nfolder={folder}\n")
 
-          print(f"✅  URL     : {url}")
-          print(f"✅  Format  : {fmt}")
-          print(f"✅  Quality : {qual}")
-          print(f"✅  Folder  : {folder}")
+          print(f"✅  URL={url}  FMT={fmt}  QUAL={qual}  FOLDER={folder}")
           PYEOF
         env:
           INPUT_URL:     ${{ github.event.inputs.video_url }}
@@ -110,7 +110,7 @@ jobs:
           INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
           INPUT_FOLDER:  ${{ github.event.inputs.output_folder }}
 
-      # ─────────────────────────────────────────
+      # ── Download ─────────────────────────────────────────────────────────
       - name: Download with yt-dlp
         id: download
         run: |
@@ -121,90 +121,83 @@ jobs:
           fmt     = "${{ steps.validate.outputs.fmt }}"
           quality = "${{ steps.validate.outputs.quality }}"
           folder  = "${{ steps.validate.outputs.folder }}"
+          cookies = "${{ steps.cookies.outputs.cookie_arg }}"  # e.g. "--cookies /tmp/yt_cookies.txt"
           tmp_dir = os.path.join(folder, ".tmp_dl")
           os.makedirs(tmp_dir, exist_ok=True)
 
           out_tmpl = os.path.join(tmp_dir, "%(title).80s [%(id)s].%(ext)s")
 
-          base = [
-              "yt-dlp",
-              "--no-playlist",
-              "--embed-thumbnail",
-              "--add-metadata",
-              "--restrict-filenames",
-              "--no-warnings",
-              "--progress",
-              "-o", out_tmpl,
-          ]
+          # Cookie flags (split into list if present)
+          cookie_flags = cookies.split() if cookies.strip() else []
 
-          if fmt == "mp3":
-              bitrate = quality.replace("kbps", "")
-              cmd = base + [
-                  "-x",
-                  "--audio-format", "mp3",
-                  "--audio-quality", bitrate,
-                  url,
-              ]
-          else:
-              height = quality.rstrip("p")
-              # Broad fallback chain — handles geo-restrictions and missing codecs
-              fmt_sel = "/".join([
-                  f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]",
-                  f"bestvideo[height<={height}]+bestaudio[ext=m4a]",
-                  f"bestvideo[height<={height}]+bestaudio",
-                  f"best[height<={height}][ext=mp4]",
-                  f"best[height<={height}]",
-                  "bestvideo+bestaudio",
-                  "best",
-              ])
-              cmd = base + [
-                  "-f", fmt_sel,
-                  "--merge-output-format", "mp4",
-                  url,
-              ]
+          # ── Clients to try in order (each bypasses bot-check differently) ──
+          # tv_embedded  → no sign-in required, no bot check
+          # mweb         → mobile web client, less restricted
+          # web          → standard (needs cookies on shared IPs)
+          CLIENTS = ["tv_embedded", "mweb", "ios", "android"]
 
-          print(f"▶  Running yt-dlp …\n   URL     : {url}")
-          print(f"   Format  : {fmt}  |  Quality: {quality}\n")
-
-          result = subprocess.run(cmd)
-
-          if result.returncode != 0:
-              # Last-resort fallback — just grab whatever yt-dlp can find
-              print("\n⚠️  Primary format selector failed → retrying with best/fallback …")
-              fallback = [
+          def build_cmd(client, fmt_sel, extra_flags=None):
+              cmd = [
                   "yt-dlp",
                   "--no-playlist",
+                  "--extractor-args", f"youtube:player_client={client}",
                   "--restrict-filenames",
                   "--no-warnings",
                   "--progress",
-                  "-f", "bv*+ba/b",   # yt-dlp native shorthand: best video+audio or best combined
-                  "--merge-output-format", "mp4",
                   "-o", out_tmpl,
-                  url,
-              ]
-              result2 = subprocess.run(fallback)
-              if result2.returncode != 0:
-                  print("::error::yt-dlp failed on both attempts. Verify the URL is public and not age-restricted.")
-                  sys.exit(1)
+              ] + cookie_flags + (extra_flags or [])
 
-          # Find downloaded file
-          files = [f for f in os.listdir(tmp_dir) if os.path.isfile(os.path.join(tmp_dir, f))]
-          if not files:
-              print("::error::No output file found after download.")
+              if fmt == "mp3":
+                  bitrate = quality.replace("kbps", "")
+                  cmd += ["-x", "--audio-format", "mp3", "--audio-quality", bitrate]
+              else:
+                  cmd += ["-f", fmt_sel, "--merge-output-format", "mp4"]
+
+              cmd.append(url)
+              return cmd
+
+          height = quality.rstrip("p")
+          fmt_sel = "/".join([
+              f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]",
+              f"bestvideo[height<={height}]+bestaudio",
+              f"best[height<={height}]",
+              "bestvideo+bestaudio",
+              "best",
+          ])
+
+          success = False
+          for client in CLIENTS:
+              print(f"\n▶  Trying client: [{client}]")
+              result = subprocess.run(build_cmd(client, fmt_sel))
+              if result.returncode == 0:
+                  # Check a file actually appeared
+                  files = [f for f in os.listdir(tmp_dir) if os.path.isfile(os.path.join(tmp_dir, f))]
+                  if files:
+                      success = True
+                      print(f"✅  Success with client [{client}]")
+                      break
+              print(f"⚠️   Client [{client}] failed — trying next …")
+
+          if not success:
+              print("\n::error::All clients failed.")
+              print("::error::Possible reasons:")
+              print("::error::  1. Video is age-restricted or private → provide cookies")
+              print("::error::  2. Video is unavailable in GitHub's region")
+              print("::error::  3. YouTube changed their API — update yt-dlp")
               sys.exit(1)
 
+          files = [f for f in os.listdir(tmp_dir) if os.path.isfile(os.path.join(tmp_dir, f))]
           downloaded = files[0]
           size_mb = os.path.getsize(os.path.join(tmp_dir, downloaded)) / (1024 * 1024)
-          print(f"\n✅  File    : {downloaded}")
-          print(f"✅  Size    : {size_mb:.1f} MB")
+
+          print(f"\n✅  File : {downloaded}")
+          print(f"✅  Size : {size_mb:.1f} MB")
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
-              fh.write(f"filename={downloaded}\n")
-              fh.write(f"tmp_dir={tmp_dir}\n")
-              fh.write(f"size_mb={size_mb:.1f}\n")
+              fh.write(f"filename={downloaded}\ntmp_dir={tmp_dir}\nsize_mb={size_mb:.1f}\n")
           PYEOF
 
-      # ─────────────────────────────────────────
+      # ── Split or move ────────────────────────────────────────────────────
       - name: Split or move file
         run: |
           python3 << 'PYEOF'
@@ -215,66 +208,47 @@ jobs:
           filename = "${{ steps.download.outputs.filename }}"
           size_mb  = float("${{ steps.download.outputs.size_mb }}")
 
-          raw = "${{ github.event.inputs.max_part_mb }}".strip()
           try:
-              thresh = int(float(raw))
+              thresh = int(float("${{ github.event.inputs.max_part_mb }}".strip()))
           except (ValueError, TypeError):
               thresh = 0
-
-          # Always stay under GitHub's 100 MB file limit
           if thresh <= 0 or thresh > 95:
               thresh = 95
 
           src = os.path.join(tmp_dir, filename)
 
           if size_mb > thresh:
-              print(f"📦  {size_mb:.1f} MB > {thresh} MB → splitting into parts")
+              print(f"📦  {size_mb:.1f} MB > {thresh} MB → splitting")
               zip_base = os.path.join(folder, filename + ".zip")
-              subprocess.run(
-                  ["zip", "-r", "-s", f"{thresh}m", zip_base, "--", src],
-                  check=True,
-              )
+              subprocess.run(["zip", "-r", "-s", f"{thresh}m", zip_base, "--", src], check=True)
               parts = sorted([
                   f for f in os.listdir(folder)
                   if f.startswith(filename + ".z") or f == filename + ".zip"
               ])
-              print(f"✅  {len(parts)} part(s): {parts}")
-
-              readme = os.path.join(folder, f"HOW_TO_JOIN_{filename}.txt")
-              with open(readme, "w") as fh:
+              print(f"✅  {len(parts)} part(s) created")
+              with open(os.path.join(folder, f"HOW_TO_JOIN_{filename}.txt"), "w") as fh:
                   fh.write(
-                      f"To reassemble '{filename}', download ALL parts:\n"
-                      + "\n".join(f"  {p}" for p in parts)
-                      + "\n\nLinux / macOS:\n"
-                      + f"  zip -FF {filename}.zip --out full.zip && unzip full.zip\n\n"
-                      + "Windows:\n"
-                      + "  Open the .zip file with 7-Zip.\n"
+                      f"Download ALL parts:\n" + "\n".join(f"  {p}" for p in parts) +
+                      "\n\nLinux/macOS:\n  zip -FF " + filename + ".zip --out full.zip && unzip full.zip" +
+                      "\n\nWindows:\n  Open .zip with 7-Zip\n"
                   )
           else:
               print(f"📁  {size_mb:.1f} MB ≤ {thresh} MB → moving directly")
               shutil.move(src, os.path.join(folder, filename))
 
           shutil.rmtree(tmp_dir, ignore_errors=True)
-          print("✅  Done")
           PYEOF
 
-      # ─────────────────────────────────────────
+      # ── Commit & push ────────────────────────────────────────────────────
       - name: Commit and push
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          FOLDER="${{ steps.validate.outputs.folder }}"
-          git add "$FOLDER/"
-
+          git add "${{ steps.validate.outputs.folder }}/"
           if git diff --cached --quiet; then
-            echo "Nothing new to commit."
+            echo "Nothing to commit."
           else
-            FNAME="${{ steps.download.outputs.filename }}"
-            SIZE="${{ steps.download.outputs.size_mb }}"
-            FMT="${{ steps.validate.outputs.fmt }}"
-            QUAL="${{ steps.validate.outputs.quality }}"
-            git commit -m "⬇️ YT ${FMT^^} – ${FNAME} (${SIZE} MB, ${QUAL}) [skip ci]"
+            git commit -m "⬇️ YT ${{ steps.validate.outputs.fmt }} – ${{ steps.download.outputs.filename }} (${{ steps.download.outputs.size_mb }} MB, ${{ steps.validate.outputs.quality }}) [skip ci]"
             git push
-            echo "✅  Pushed to $FOLDER/"
+            echo "✅  Pushed to ${{ steps.validate.outputs.folder }}/"
           fi
